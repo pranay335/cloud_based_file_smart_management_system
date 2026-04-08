@@ -1,9 +1,9 @@
 import os
-import time
 import uuid
 from io import BytesIO
 from typing import Any
 
+import fitz
 import pytesseract
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
@@ -22,6 +22,8 @@ pytesseract.pytesseract.tesseract_cmd = os.getenv(
 )
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+PDF_EXTENSIONS = {".pdf"}
+TEXT_EXTENSIONS = {".txt"}
 KEYWORD_RULES = {
     "Invoice": ["invoice", "tax", "gst", "amount due", "bill to"],
     "Receipt": ["receipt", "paid", "cash", "total", "transaction"],
@@ -36,24 +38,45 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = Flask(__name__)
 
 
-def _extract_function_data(response: Any) -> dict[str, Any]:
-    if response is None:
-        return {}
-    if isinstance(response, dict):
-        return response
-    if hasattr(response, "data") and isinstance(response.data, dict):
-        return response.data
-    if hasattr(response, "model_dump"):
-        dumped = response.model_dump()
-        if isinstance(dumped, dict):
-            if isinstance(dumped.get("data"), dict):
-                return dumped["data"]
-            return dumped
-    return {}
-
-
 def _is_image_file(filename: str) -> bool:
     return os.path.splitext(filename.lower())[1] in IMAGE_EXTENSIONS
+
+
+def _debug_response_payload(response: Any) -> Any:
+    if response is None:
+        return None
+    if isinstance(response, dict):
+        return response
+    if hasattr(response, "model_dump"):
+        try:
+            return response.model_dump()
+        except Exception:  # noqa: BLE001
+            return str(response)
+    if hasattr(response, "data"):
+        return {"data": getattr(response, "data")}
+    return str(response)
+
+
+def _extract_text_from_file(filename: str, file_bytes: bytes) -> str:
+    extension = os.path.splitext(filename.lower())[1]
+
+    if extension in IMAGE_EXTENSIONS:
+        return pytesseract.image_to_string(Image.open(BytesIO(file_bytes))).strip()
+
+    if extension in PDF_EXTENSIONS:
+        pages: list[str] = []
+        with fitz.open(stream=file_bytes, filetype="pdf") as pdf_doc:
+            for page in pdf_doc:
+                pages.append(page.get_text("text") or "")
+        return "\n".join(pages).strip()
+
+    if extension in TEXT_EXTENSIONS:
+        try:
+            return file_bytes.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return file_bytes.decode("latin-1", errors="ignore").strip()
+
+    return ""
 
 
 def _classify_text_by_keywords(text: str) -> dict[str, Any]:
@@ -69,24 +92,6 @@ def _classify_text_by_keywords(text: str) -> dict[str, Any]:
 
     confidence = round(min(best_score / 3, 1.0), 2) if best_score else 0
     return {"category": best_category, "confidence": confidence}
-
-
-def _invoke_classify_function_with_retry(payload: dict[str, Any], max_attempts: int = 2) -> Any:
-    last_error: Exception | None = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return supabase.functions.invoke(
-                "classify-doc",
-                invoke_options={"body": payload},
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if "timed out" not in str(exc).lower() or attempt == max_attempts:
-                raise
-            time.sleep(1)
-    if last_error:
-        raise last_error
-    raise RuntimeError("Unexpected classify-doc invocation state")
 
 
 @app.route("/", methods=["GET"])
@@ -108,8 +113,8 @@ def classify_documents():
         return jsonify({"error": "No files were uploaded."}), 400
 
     uploaded_paths: list[dict[str, str]] = []
-    ocr_text_by_file: dict[str, str] = {}
-    ocr_errors: list[dict[str, str]] = []
+    extracted_text_by_file: dict[str, str] = {}
+    extraction_errors: list[dict[str, str]] = []
 
     try:
         for file in valid_files:
@@ -120,79 +125,56 @@ def classify_documents():
             if not file_bytes:
                 continue
 
-            supabase.storage.from_("documents").upload(
+            storage_response = supabase.storage.from_("documents").upload(
                 object_path,
                 file_bytes,
                 {"upsert": "true", "content-type": file.mimetype or "application/octet-stream"},
             )
+            print(f"[storage.upload] file={file.filename} path={object_path} response={storage_response}")
 
             extracted_text = ""
-            if _is_image_file(file.filename):
-                try:
-                    extracted_text = pytesseract.image_to_string(Image.open(BytesIO(file_bytes)))
-                    ocr_text_by_file[file.filename] = extracted_text
-                except Exception as ocr_exc:  # noqa: BLE001
-                    ocr_errors.append({"file": file.filename, "error": str(ocr_exc)})
+            try:
+                extracted_text = _extract_text_from_file(file.filename, file_bytes)
+                extracted_text_by_file[file.filename] = extracted_text
+                print(
+                    f"[text.extract] file={file.filename} chars={len(extracted_text)} extension={os.path.splitext(file.filename.lower())[1]}"
+                )
+            except Exception as text_exc:  # noqa: BLE001
+                extraction_errors.append({"file": file.filename, "error": str(text_exc)})
+                print(f"[text.extract.error] file={file.filename} error={text_exc}")
+
+            insert_payload = {
+                "file_name": file.filename,
+                "folder_location": object_path,
+                "content_text": extracted_text,
+            }
+            table_insert_response = supabase.table("documents").insert(insert_payload).execute()
+            print(
+                f"[table.insert] file={file.filename} path={object_path} response={_debug_response_payload(table_insert_response)}"
+            )
 
             uploaded_paths.append({"file": file.filename, "path": object_path, "ocr_text": extracted_text})
 
         if not uploaded_paths:
             return jsonify({"error": "Uploaded files were empty."}), 400
 
-        fn_response = _invoke_classify_function_with_retry(
-            payload={"action": "classify_all", "ocr_text_by_file": ocr_text_by_file},
-            max_attempts=2,
-        )
-
-        data = _extract_function_data(fn_response)
-
-        # Keep frontend contract stable if edge function returns an unexpected shape.
-        if "details" not in data:
-            details = []
-            for entry in uploaded_paths:
-                keyword_result = _classify_text_by_keywords(entry.get("ocr_text", ""))
-                details.append(
-                    {
-                        "file": entry["file"],
-                        "category": keyword_result["category"],
-                        "confidence": keyword_result["confidence"],
-                        "destination": entry["path"],
-                    }
-                )
-            data["details"] = details
-
-        # If OCR failed for any image, include warnings without failing the full request.
-        if ocr_errors:
-            data["ocr_warnings"] = ocr_errors
-
-        # Persist searchable metadata and OCR output in the documents table.
-        entries_by_file: dict[str, list[dict[str, str]]] = {}
+        details = []
         for entry in uploaded_paths:
-            entries_by_file.setdefault(entry["file"], []).append(entry)
-
-        rows_to_insert = []
-        for detail in data.get("details", []):
-            file_name = detail.get("file")
-            if not file_name:
-                continue
-
-            matched_entry = None
-            if file_name in entries_by_file and entries_by_file[file_name]:
-                matched_entry = entries_by_file[file_name].pop(0)
-
-            folder_location = detail.get("destination") or (matched_entry.get("path") if matched_entry else "")
-            content_text = (matched_entry.get("ocr_text") if matched_entry else "") or ""
-
-            rows_to_insert.append(
+            keyword_result = _classify_text_by_keywords(entry.get("ocr_text", ""))
+            details.append(
                 {
-                    "file_name": file_name,
-                    "folder_location": folder_location,
-                    "content_text": content_text,
+                    "file": entry["file"],
+                    "category": keyword_result["category"],
+                    "confidence": keyword_result["confidence"],
+                    "destination": entry["path"],
                 }
             )
 
-        if rows_to_insert:
-            supabase.table("documents").insert(rows_to_insert).execute()
+        data = {"details": details, "source": "local_flask"}
+
+        # If OCR failed for any image, include warnings without failing the full request.
+        if extraction_errors:
+            data["ocr_warnings"] = extraction_errors
 
         return jsonify(data), 200
 
@@ -216,7 +198,7 @@ def classify_documents():
             return (
                 jsonify(
                     {
-                        "error": "Supabase Edge Function auth failed. Use the legacy service_role JWT key (starts with 'eyJ') in SUPABASE_KEY, not an sb_secret/sb_publishable key.",
+                        "error": "Supabase auth failed. Ensure SUPABASE_KEY is a valid service_role JWT for server-side storage and table operations.",
                         "details": combined_error,
                     }
                 ),
@@ -226,21 +208,11 @@ def classify_documents():
             return (
                 jsonify(
                     {
-                        "error": "Edge Function timed out. Your classify-doc function is taking too long to respond.",
+                        "error": "Request timed out while processing upload/search. Try fewer or smaller files and check Supabase latency.",
                         "details": combined_error,
                     }
                 ),
                 504,
-            )
-        if "requesting your edge function" in error_message:
-            return (
-                jsonify(
-                    {
-                        "error": "Edge Function invocation failed. Ensure 'classify-doc' is deployed and set SUPABASE_KEY to legacy service_role JWT (starts with 'eyJ').",
-                        "details": combined_error,
-                    }
-                ),
-                502,
             )
         return jsonify({"error": error_message, "details": combined_error}), 500
 
@@ -252,12 +224,14 @@ def search_documents():
         return jsonify({"error": "Missing query parameter: q"}), 400
 
     try:
+        print(f"[search] query={query}")
         response = (
             supabase.table("documents")
             .select("*")
             .text_search("content_text", query)
             .execute()
         )
+        print(f"[search.response] payload={_debug_response_payload(response)}")
         return jsonify({"results": response.data or []}), 200
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
