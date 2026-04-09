@@ -12,6 +12,9 @@ ENV/
 # Environment variables
 .env
 .env.*
+.env.local
+.env.development
+.env.production
 !.env.example
 
 # Build and packaging artifacts
@@ -23,6 +26,7 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ipynb_checkpoints/
 
 # OS/editor files
 .DS_Store
