@@ -310,5 +310,170 @@ def search_documents():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/download", methods=["GET"])
+def download_file():
+    path = request.args.get("path", "").strip()
+    if not path:
+        return jsonify({"error": "Missing path parameter."}), 400
+    try:
+        url = database_service.get_download_url(path, expires_in=120)
+        return jsonify({"url": url}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/share", methods=["GET"])
+def share_file():
+    path = request.args.get("path", "").strip()
+    if not path:
+        return jsonify({"error": "Missing path parameter."}), 400
+    try:
+        url = database_service.get_download_url(path, expires_in=604800)  # 7 days
+        return jsonify({"url": url}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+# ── Admin Dashboard ──────────────────────────────────────────────
+
+
+@app.route("/admin", methods=["GET"])
+def admin_page() -> str:
+    return render_template("admin.html")
+
+
+@app.route("/api/admin/stats", methods=["GET"])
+def admin_stats():
+    try:
+        stats = database_service.get_admin_stats()
+        return jsonify(stats), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/documents", methods=["GET"])
+def admin_list_documents():
+    try:
+        response = database_service.get_all_documents()
+        return jsonify({"data": response.data or []}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/documents/<int:doc_id>", methods=["GET"])
+def admin_get_document(doc_id: int):
+    try:
+        response = database_service.get_document(doc_id)
+        return jsonify({"data": response.data}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/documents/<int:doc_id>", methods=["PUT"])
+def admin_update_document(doc_id: int):
+    payload = request.get_json(silent=True) or {}
+    if not payload:
+        return jsonify({"error": "Empty payload."}), 400
+    # Only allow safe fields
+    allowed = {"file_name", "category", "confidence", "status", "mime_type"}
+    filtered = {k: v for k, v in payload.items() if k in allowed}
+    if not filtered:
+        return jsonify({"error": "No valid fields to update."}), 400
+    try:
+        response = database_service.update_document(doc_id, filtered)
+        return jsonify({"data": response.data}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/documents/<int:doc_id>", methods=["DELETE"])
+def admin_delete_document(doc_id: int):
+    try:
+        # Get document first so we can also delete the storage file
+        doc_resp = database_service.get_document(doc_id)
+        doc = doc_resp.data
+        folder_location = doc.get("folder_location", "") if doc else ""
+
+        database_service.delete_document(doc_id)
+
+        # Try to delete the storage object too
+        if folder_location:
+            try:
+                database_service.delete_storage_object(folder_location)
+            except Exception:  # noqa: BLE001
+                pass  # storage delete is best-effort
+
+        return jsonify({"message": "Document deleted."}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/download", methods=["GET"])
+def admin_download():
+    path = request.args.get("path", "").strip()
+    if not path:
+        return jsonify({"error": "Missing path parameter."}), 400
+    try:
+        url = database_service.get_download_url(path)
+        return jsonify({"url": url}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/categories", methods=["GET"])
+def admin_list_categories():
+    try:
+        response = database_service.get_all_categories()
+        return jsonify({"data": response.data or []}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/categories", methods=["POST"])
+def admin_create_category():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("category_name") or "").strip()
+    if not name:
+        return jsonify({"error": "category_name is required."}), 400
+    insert_data = {
+        "category_name": name,
+        "keywords": payload.get("keywords", []),
+        "extensions": payload.get("extensions", []),
+        "score_weight": float(payload.get("score_weight", 1)),
+    }
+    try:
+        response = database_service.create_category(insert_data)
+        return jsonify({"data": response.data}), 201
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/categories/<int:cat_id>", methods=["PUT"])
+def admin_update_category(cat_id: int):
+    payload = request.get_json(silent=True) or {}
+    if not payload:
+        return jsonify({"error": "Empty payload."}), 400
+    allowed = {"category_name", "keywords", "extensions", "score_weight"}
+    filtered = {k: v for k, v in payload.items() if k in allowed}
+    if not filtered:
+        return jsonify({"error": "No valid fields to update."}), 400
+    if "score_weight" in filtered:
+        filtered["score_weight"] = float(filtered["score_weight"])
+    try:
+        response = database_service.update_category(cat_id, filtered)
+        return jsonify({"data": response.data}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/admin/categories/<int:cat_id>", methods=["DELETE"])
+def admin_delete_category(cat_id: int):
+    try:
+        database_service.delete_category(cat_id)
+        return jsonify({"message": "Category deleted."}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True)

@@ -6,6 +6,7 @@
     <meta name="description" content="Smart Document Classifier — Upload, classify, and search documents with AI-powered categorization stored in the cloud.">
     <title>Smart Document Classifier</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>">
 </head>
 <body>
@@ -48,6 +49,12 @@
                         <rect x="14" y="14" width="7" height="7"/>
                     </svg>
                     <span class="sidebar-nav-label">Results</span>
+                </a>
+                <a href="/admin" class="sidebar-nav-item" id="nav-admin" title="Admin Dashboard">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                    <span class="sidebar-nav-label">Admin Dash</span>
                 </a>
             </nav>
 
@@ -159,12 +166,29 @@
                             <span class="panel-count" id="searchResultsCount"></span>
                         </div>
                         <div id="searchResultsContainer"></div>
-                    </div>
+                </div>
                 </section>
 
             </div>
         </main>
 
+    </div>
+
+    <!-- Modal Backdrop -->
+    <div class="modal-backdrop" id="modalBackdrop" hidden></div>
+
+    <!-- View Document Modal -->
+    <div class="modal" id="searchViewModal" hidden>
+        <div class="modal-header">
+            <span class="modal-title">Document Details</span>
+            <button class="modal-close" id="searchViewClose" title="Close">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+        </div>
+        <div class="modal-body" id="searchViewBody"></div>
+        <div class="modal-footer">
+            <button class="btn btn-outline btn-sm" id="searchViewCloseBtn" type="button">Close</button>
+        </div>
     </div>
 
     <!-- Toast container -->

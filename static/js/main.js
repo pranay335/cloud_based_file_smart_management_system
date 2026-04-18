@@ -53,8 +53,10 @@ sidebarLogo.addEventListener("click", () => {
 // Sidebar nav — smooth scroll & active state
 document.querySelectorAll(".sidebar-nav-item").forEach((item) => {
     item.addEventListener("click", (e) => {
-        e.preventDefault();
         const sectionId = item.getAttribute("data-section");
+        if (!sectionId) return; // Allow normal navigation for links like /admin
+
+        e.preventDefault();
         const section = document.getElementById(sectionId);
 
         // Make section visible if hidden
@@ -380,6 +382,9 @@ function renderSearchResults(query, results) {
         return;
     }
 
+    // Store results for modal view
+    window._searchResults = results;
+
     searchResultsTitle.textContent = `Search: "${escapeHtml(query)}"`;
     searchResultsCount.textContent = `${results.length} result${results.length !== 1 ? "s" : ""}`;
 
@@ -389,26 +394,124 @@ function renderSearchResults(query, results) {
                 <thead>
                     <tr>
                         <th>File</th>
-                        <th>Location</th>
                         <th>Category</th>
+                        <th>Confidence</th>
                         <th>Size</th>
                         <th>Type</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
-                    ${results.map((entry) => `
+                    ${results.map((entry, idx) => `
                         <tr>
                             <td class="cell-file">${escapeHtml(entry.file_name || "Unknown")}</td>
-                            <td>${escapeHtml(entry.folder_location || "-")}</td>
                             <td><span class="badge-category">${escapeHtml(entry.category || "-")}</span></td>
+                            <td>${entry.confidence ?? 0}%</td>
                             <td>${typeof entry.file_size === "number" ? formatFileSize(entry.file_size) : (entry.file_size || "-")}</td>
                             <td>${escapeHtml(entry.mime_type || "-")}</td>
+                            <td class="cell-actions">
+                                <button class="action-btn action-view" title="View details" onclick="searchViewDoc(${idx})">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                                </button>
+                                <button class="action-btn action-edit" title="Copy share link" onclick="searchShareDoc('${escapeHtml(entry.folder_location || "")}')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                                </button>
+                                <button class="action-btn action-download" title="Download" onclick="searchDownloadDoc('${escapeHtml(entry.folder_location || "")}')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                </button>
+                            </td>
                         </tr>
                     `).join("")}
                 </tbody>
             </table>
         </div>
     `;
+}
+
+// --- Search Result Actions ---
+const searchViewModal    = document.getElementById("searchViewModal");
+const searchViewBody     = document.getElementById("searchViewBody");
+const searchViewClose    = document.getElementById("searchViewClose");
+const searchViewCloseBtn = document.getElementById("searchViewCloseBtn");
+const modalBackdrop      = document.getElementById("modalBackdrop");
+
+function openSearchModal() {
+    modalBackdrop.hidden = false;
+    searchViewModal.hidden = false;
+}
+
+function closeSearchModal() {
+    searchViewModal.hidden = true;
+    modalBackdrop.hidden = true;
+}
+
+searchViewClose.addEventListener("click", closeSearchModal);
+searchViewCloseBtn.addEventListener("click", closeSearchModal);
+modalBackdrop.addEventListener("click", closeSearchModal);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSearchModal(); });
+
+async function searchViewDoc(idx) {
+    const docMeta = (window._searchResults || [])[idx];
+    if (!docMeta || !docMeta.id) return;
+    
+    openSearchModal();
+    searchViewBody.innerHTML = `<div class="empty-state"><div class="status-spinner" style="margin:0 auto 8px;"></div><div class="empty-state-text">Loading details...</div></div>`;
+    
+    try {
+        const res = await fetch(`/api/admin/documents/${docMeta.id}`);
+        const json = await parseJsonGuarded(res);
+        const doc = json.data;
+        if (!doc) throw new Error("Document not found.");
+
+        const contentPreview = (doc.content_text || "").substring(0, 2000);
+        const hasMore = (doc.content_text || "").length > 2000;
+
+        searchViewBody.innerHTML = `
+            <div class="detail-grid">
+                <div class="detail-row"><div class="detail-label">ID</div><div class="detail-value">${doc.id ?? "—"}</div></div>
+                <div class="detail-row"><div class="detail-label">File Name</div><div class="detail-value">${escapeHtml(doc.file_name || "—")}</div></div>
+                <div class="detail-row"><div class="detail-label">Category</div><div class="detail-value"><span class="badge-category">${escapeHtml(doc.category || "—")}</span></div></div>
+                <div class="detail-row"><div class="detail-label">Confidence</div><div class="detail-value">${doc.confidence ?? 0}%</div></div>
+                <div class="detail-row"><div class="detail-label">Status</div><div class="detail-value">${escapeHtml(doc.status || "—")}</div></div>
+                <div class="detail-row"><div class="detail-label">MIME Type</div><div class="detail-value">${escapeHtml(doc.mime_type || "—")}</div></div>
+                <div class="detail-row"><div class="detail-label">File Size</div><div class="detail-value">${typeof doc.file_size === "number" ? formatFileSize(doc.file_size) : "—"}</div></div>
+                <div class="detail-row"><div class="detail-label">Content</div><div class="detail-value text-preview" style="max-height: 200px; overflow-y: auto; padding: 10px; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; color: var(--text-secondary); white-space: pre-wrap; line-height: 1.5;">${escapeHtml(contentPreview) || "(empty)"}${hasMore ? "\n\n… (truncated)" : ""}</div></div>
+            </div>
+        `;
+    } catch (e) {
+        searchViewBody.innerHTML = `<div class="empty-state"><div class="empty-state-text">${escapeHtml(e.message)}</div></div>`;
+    }
+}
+
+async function searchShareDoc(path) {
+    if (!path) return showToast("error", "Share", "No file path available.");
+    try {
+        const res = await fetch(`/api/share?path=${encodeURIComponent(path)}`);
+        const json = await parseJsonGuarded(res);
+        if (json.url) {
+            await navigator.clipboard.writeText(json.url);
+            showToast("success", "Link Copied", "Share link copied to clipboard (valid for 7 days).");
+        } else {
+            showToast("error", "Share", "Could not generate share link.");
+        }
+    } catch (e) {
+        showToast("error", "Share Failed", e.message);
+    }
+}
+
+async function searchDownloadDoc(path) {
+    if (!path) return showToast("error", "Download", "No file path available.");
+    try {
+        const res = await fetch(`/api/download?path=${encodeURIComponent(path)}`);
+        const json = await parseJsonGuarded(res);
+        if (json.url) {
+            window.open(json.url, "_blank");
+        } else {
+            showToast("error", "Download", "Could not generate download URL.");
+        }
+    } catch (e) {
+        showToast("error", "Download Failed", e.message);
+    }
 }
 
 // --- Toast Notifications ---
@@ -505,3 +608,4 @@ mainEl.addEventListener("scroll", () => {
         item.classList.toggle("active", item.getAttribute("data-section") === activeId);
     });
 });
+
