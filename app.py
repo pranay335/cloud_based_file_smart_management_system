@@ -9,7 +9,7 @@ from supabase import Client, create_client
 from werkzeug.utils import secure_filename
 
 from services.classifier_service import classify_document, set_supabase_client
-from services.database_service import DatabaseService
+from services.database_service import DatabaseService, _has_created_by
 from services.ocr_service import OCRService
 from services.pdf_service import PDFService
 from services.text_extractor_service import TextExtractorService
@@ -18,6 +18,11 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ADMIN_EMAILS = {
+    item.strip().lower()
+    for item in os.getenv("ADMIN_EMAILS", "").split(",")
+    if item.strip()
+}
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY in environment variables.")
@@ -32,12 +37,101 @@ job_store: dict[str, dict[str, Any]] = {}
 job_lock = threading.Lock()
 
 
+def _extract_access_token() -> str:
+    auth_header = (request.headers.get("Authorization", "") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    return (request.headers.get("X-Access-Token", "") or "").strip()
+
+
+def _get_authenticated_user() -> tuple[dict[str, str] | None, tuple[Any, int] | None]:
+    token = _extract_access_token()
+    if not token:
+        return None, (jsonify({"error": "Unauthorized. Missing bearer token."}), 401)
+
+    try:
+        identity = database_service.get_user_identity_from_token(token)
+    except Exception as exc:  # noqa: BLE001
+        return None, (jsonify({"error": f"Unauthorized. Invalid token: {exc}"}), 401)
+
+    email = (identity or {}).get("email", "")
+    user_id = (identity or {}).get("id", "")
+
+    if not email:
+        return None, (jsonify({"error": "Unauthorized. Could not resolve user identity."}), 401)
+
+    return {"email": email, "id": user_id}, None
+
+
+def _get_authenticated_email() -> tuple[str | None, tuple[Any, int] | None]:
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return None, auth_error
+    return (user or {}).get("email", ""), None
+
+
+def _get_admin_email() -> tuple[str | None, tuple[Any, int] | None]:
+    email, auth_error = _get_authenticated_email()
+    if auth_error:
+        return None, auth_error
+    if not email or email.lower() not in ADMIN_EMAILS:
+        return None, (jsonify({"error": "Forbidden. Admin access required."}), 403)
+    return email, None
+
+
+def _extract_auth_result(res: Any, fallback_email: str = "") -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Support both object and dict-shaped Supabase auth responses."""
+    session_data: dict[str, Any] | None = None
+    user_data: dict[str, Any] | None = None
+
+    session_obj = getattr(res, "session", None)
+    if session_obj is None and isinstance(res, dict):
+        session_obj = res.get("session") or (res.get("data") or {}).get("session")
+
+    if session_obj:
+        if isinstance(session_obj, dict):
+            session_data = {
+                "access_token": session_obj.get("access_token"),
+                "refresh_token": session_obj.get("refresh_token"),
+            }
+        else:
+            session_data = {
+                "access_token": getattr(session_obj, "access_token", None),
+                "refresh_token": getattr(session_obj, "refresh_token", None),
+            }
+
+    user_obj = getattr(res, "user", None)
+    if user_obj is None and isinstance(res, dict):
+        user_obj = res.get("user") or (res.get("data") or {}).get("user")
+
+    if user_obj:
+        if isinstance(user_obj, dict):
+            user_data = {
+                "id": str(user_obj.get("id") or ""),
+                "email": user_obj.get("email") or fallback_email,
+                "user_metadata": user_obj.get("user_metadata") or {},
+            }
+        else:
+            user_data = {
+                "id": str(getattr(user_obj, "id", "")),
+                "email": getattr(user_obj, "email", fallback_email),
+                "user_metadata": getattr(user_obj, "user_metadata", {}),
+            }
+
+    return session_data, user_data
+
+
 def _set_job_state(job_id: str, state: dict[str, Any]) -> None:
     with job_lock:
         job_store[job_id] = state
 
 
-def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]]) -> None:
+def _run_background_processing(
+    job_id: str,
+    files_payload: list[dict[str, Any]],
+    created_by: str = "",
+    owner_user_id: str = "",
+) -> None:
     _set_job_state(
         job_id,
         {
@@ -48,6 +142,7 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
             "total": len(files_payload),
             "details": [],
             "warnings": [],
+            "created_by": created_by,
         },
     )
 
@@ -58,7 +153,10 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
         for index, item in enumerate(files_payload, start=1):
             file_name = item["filename"]
             safe_name = secure_filename(file_name)
-            storage_path = f"uploads/{uuid.uuid4().hex}_{safe_name}"
+            if owner_user_id:
+                storage_path = f"users/{owner_user_id}/uploads/{uuid.uuid4().hex}_{safe_name}"
+            else:
+                storage_path = f"uploads/{uuid.uuid4().hex}_{safe_name}"
             file_bytes = item["bytes"]
             content_type = item.get("mimetype") or "application/octet-stream"
 
@@ -98,7 +196,10 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
                 final_path = storage_path  # keep in uploads/
                 db_status = "uncategorized"
             else:
-                classified_path = f"classified/{category}/{storage_path.split('/')[-1]}"
+                if owner_user_id:
+                    classified_path = f"users/{owner_user_id}/classified/{category}/{storage_path.split('/')[-1]}"
+                else:
+                    classified_path = f"classified/{category}/{storage_path.split('/')[-1]}"
                 try:
                     supabase.storage.from_("documents").move(storage_path, classified_path)
                     final_path = classified_path
@@ -123,6 +224,8 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
                 category,
                 confidence,
                 db_status,
+                created_by,
+                owner_user_id,
             )
 
             details.append(
@@ -144,6 +247,7 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
                     "total": len(files_payload),
                     "details": details,
                     "warnings": warnings,
+                    "created_by": created_by,
                 },
             )
 
@@ -158,6 +262,7 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
                 "details": details,
                 "warnings": warnings,
                 "source": "local_flask_background",
+                "created_by": created_by,
             },
         )
     except Exception as exc:  # noqa: BLE001
@@ -172,6 +277,7 @@ def _run_background_processing(job_id: str, files_payload: list[dict[str, Any]])
                 "total": len(files_payload),
                 "details": details,
                 "warnings": warnings,
+                "created_by": created_by,
             },
         )
         print(f"[background.error] job_id={job_id} error={exc}")
@@ -187,8 +293,94 @@ def favicon():
     return "", 204
 
 
+@app.route("/login", methods=["GET"])
+def login_page() -> str:
+    """Static login page — will get upgraded to real soon."""
+    return render_template("login.html")
+
+
+@app.route("/signup", methods=["GET"])
+def signup_page() -> str:
+    """Convenience route for signup."""
+    return render_template("login.html")
+
+# ── Auth Endpoints ────────────────────────────────────────────────────────
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    data     = request.get_json(silent=True) or {}
+    email    = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    name     = (data.get("name") or "").strip()
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    try:
+        res = database_service.sign_up(email, password, name)
+        session_data, user_data = _extract_auth_result(res, fallback_email=email)
+
+        return jsonify({"session": session_data, "user": user_data}), 200
+
+    except Exception as exc:
+        err = str(exc)
+        if "already registered" in err.lower() or "already exists" in err.lower():
+            return jsonify({"error": "An account with this email already exists. Please sign in."}), 409
+        return jsonify({"error": err}), 400
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    data     = request.get_json(silent=True) or {}
+    identifier = (data.get("identifier") or data.get("email") or "").strip()
+    password = data.get("password") or ""
+
+    if not identifier or not password:
+        return jsonify({"error": "Email/username and password required"}), 400
+
+    try:
+        email = database_service.resolve_login_identifier_to_email(identifier)
+        res = database_service.sign_in(email, password)
+        session_data, user_data = _extract_auth_result(res, fallback_email=email)
+
+        if not session_data or not session_data.get("access_token"):
+            return jsonify({"error": "Login succeeded but no access token was returned. Check Supabase auth settings."}), 401
+
+        return jsonify({"session": session_data, "user": user_data}), 200
+
+    except Exception as exc:
+        err = str(exc)
+        if "invalid login" in err.lower() or "invalid credentials" in err.lower():
+            return jsonify({"error": "Invalid username/email or password."}), 401
+        if "email not confirmed" in err.lower():
+            return jsonify({"error": "Email not confirmed"}), 401
+        return jsonify({"error": err}), 401
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    """Client logout is local; this endpoint exists for parity and future server-side revocation."""
+    return jsonify({"message": "Logged out."}), 200
+
+
+@app.route("/api/health/supabase", methods=["GET"])
+def health_supabase():
+    """Quick connection probe for Supabase project wiring."""
+    try:
+        probe = supabase.table("documents").select("id").limit(1).execute()
+        return jsonify({"ok": True, "documents_probe_count": len(probe.data or [])}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/api/classify", methods=["POST"])
 def classify_documents():
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return auth_error
+    created_by = (user or {}).get("email", "")
+    owner_user_id = (user or {}).get("id", "")
+
     files = request.files.getlist("files")
     valid_files = [f for f in files if f and f.filename]
 
@@ -196,7 +388,6 @@ def classify_documents():
         return jsonify({"error": "No files were uploaded."}), 400
 
     files_payload: list[dict[str, Any]] = []
-
     try:
         for file in valid_files:
             file_bytes = file.read()
@@ -226,12 +417,13 @@ def classify_documents():
                 "total": len(files_payload),
                 "details": [],
                 "warnings": [],
+                "created_by": created_by,
             },
         )
 
         worker = threading.Thread(
             target=_run_background_processing,
-            args=(job_id, files_payload),
+            args=(job_id, files_payload, created_by, owner_user_id),
             daemon=True,
         )
         worker.start()
@@ -289,33 +481,88 @@ def classify_documents():
 
 @app.route("/api/jobs/<job_id>", methods=["GET"])
 def get_job_status(job_id: str):
+    created_by, auth_error = _get_authenticated_email()
+    if auth_error:
+        return auth_error
+
     with job_lock:
         job = job_store.get(job_id)
     if not job:
         return jsonify({"error": "Job not found."}), 404
+    if job.get("created_by") and job.get("created_by") != created_by:
+        return jsonify({"error": "Forbidden. This job belongs to another user."}), 403
     return jsonify(job), 200
 
 
 @app.route("/search", methods=["GET"])
 def search_documents():
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return auth_error
+    created_by = (user or {}).get("email", "")
+    owner_user_id = (user or {}).get("id", "")
+
     query = request.args.get("q", "").strip()
     if not query:
         return jsonify({"error": "Missing query parameter: q"}), 400
 
     try:
-        print(f"[search] query={query}")
-        response = database_service.search_documents(query)
+        print(f"[search] query={query} created_by={created_by or 'all'}")
+        response = database_service.search_documents(query, created_by=created_by, user_id=owner_user_id)
         return jsonify({"results": response.data or []}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/my-documents", methods=["GET"])
+def my_documents():
+    """Return only documents uploaded by the requesting user."""
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return auth_error
+    created_by = (user or {}).get("email", "")
+    owner_user_id = (user or {}).get("id", "")
+
+    try:
+        response = database_service.get_documents_by_user(created_by, user_id=owner_user_id)
+        return jsonify({"data": response.data or []}), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/user/stats", methods=["GET"])
+def user_stats():
+    """Return storage quota usage for the requesting user."""
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return auth_error
+    created_by = (user or {}).get("email", "")
+    owner_user_id = (user or {}).get("id", "")
+
+    try:
+        stats = database_service.get_user_stats(created_by, user_id=owner_user_id)
+        # e.g. 5GB limit for free tier
+        stats["quota_bytes"] = 5 * 1024 * 1024 * 1024
+        return jsonify(stats), 200
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/download", methods=["GET"])
 def download_file():
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return auth_error
+    created_by = (user or {}).get("email", "")
+    owner_user_id = (user or {}).get("id", "")
+
     path = request.args.get("path", "").strip()
     if not path:
         return jsonify({"error": "Missing path parameter."}), 400
+
     try:
+        if not database_service.user_owns_path(path, created_by=created_by, user_id=owner_user_id):
+            return jsonify({"error": "Forbidden. You do not have access to this file."}), 403
         url = database_service.get_download_url(path, expires_in=120)
         return jsonify({"url": url}), 200
     except Exception as exc:  # noqa: BLE001
@@ -324,10 +571,19 @@ def download_file():
 
 @app.route("/api/share", methods=["GET"])
 def share_file():
+    user, auth_error = _get_authenticated_user()
+    if auth_error:
+        return auth_error
+    created_by = (user or {}).get("email", "")
+    owner_user_id = (user or {}).get("id", "")
+
     path = request.args.get("path", "").strip()
     if not path:
         return jsonify({"error": "Missing path parameter."}), 400
+
     try:
+        if not database_service.user_owns_path(path, created_by=created_by, user_id=owner_user_id):
+            return jsonify({"error": "Forbidden. You do not have access to this file."}), 403
         url = database_service.get_download_url(path, expires_in=604800)  # 7 days
         return jsonify({"url": url}), 200
     except Exception as exc:  # noqa: BLE001
@@ -339,11 +595,17 @@ def share_file():
 
 @app.route("/admin", methods=["GET"])
 def admin_page() -> str:
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     return render_template("admin.html")
 
 
 @app.route("/api/admin/stats", methods=["GET"])
 def admin_stats():
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     try:
         stats = database_service.get_admin_stats()
         return jsonify(stats), 200
@@ -353,6 +615,9 @@ def admin_stats():
 
 @app.route("/api/admin/documents", methods=["GET"])
 def admin_list_documents():
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     try:
         response = database_service.get_all_documents()
         return jsonify({"data": response.data or []}), 200
@@ -360,8 +625,11 @@ def admin_list_documents():
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/admin/documents/<int:doc_id>", methods=["GET"])
-def admin_get_document(doc_id: int):
+@app.route("/api/admin/documents/<doc_id>", methods=["GET"])
+def admin_get_document(doc_id: str):
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     try:
         response = database_service.get_document(doc_id)
         return jsonify({"data": response.data}), 200
@@ -369,8 +637,11 @@ def admin_get_document(doc_id: int):
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/admin/documents/<int:doc_id>", methods=["PUT"])
-def admin_update_document(doc_id: int):
+@app.route("/api/admin/documents/<doc_id>", methods=["PUT"])
+def admin_update_document(doc_id: str):
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     if not payload:
         return jsonify({"error": "Empty payload."}), 400
@@ -386,8 +657,11 @@ def admin_update_document(doc_id: int):
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/admin/documents/<int:doc_id>", methods=["DELETE"])
-def admin_delete_document(doc_id: int):
+@app.route("/api/admin/documents/<doc_id>", methods=["DELETE"])
+def admin_delete_document(doc_id: str):
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     try:
         # Get document first so we can also delete the storage file
         doc_resp = database_service.get_document(doc_id)
@@ -410,6 +684,9 @@ def admin_delete_document(doc_id: int):
 
 @app.route("/api/admin/download", methods=["GET"])
 def admin_download():
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     path = request.args.get("path", "").strip()
     if not path:
         return jsonify({"error": "Missing path parameter."}), 400
@@ -422,6 +699,9 @@ def admin_download():
 
 @app.route("/api/admin/categories", methods=["GET"])
 def admin_list_categories():
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     try:
         response = database_service.get_all_categories()
         return jsonify({"data": response.data or []}), 200
@@ -431,6 +711,9 @@ def admin_list_categories():
 
 @app.route("/api/admin/categories", methods=["POST"])
 def admin_create_category():
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     name = (payload.get("category_name") or "").strip()
     if not name:
@@ -450,6 +733,9 @@ def admin_create_category():
 
 @app.route("/api/admin/categories/<int:cat_id>", methods=["PUT"])
 def admin_update_category(cat_id: int):
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     if not payload:
         return jsonify({"error": "Empty payload."}), 400
@@ -468,6 +754,9 @@ def admin_update_category(cat_id: int):
 
 @app.route("/api/admin/categories/<int:cat_id>", methods=["DELETE"])
 def admin_delete_category(cat_id: int):
+    _, auth_error = _get_admin_email()
+    if auth_error:
+        return auth_error
     try:
         database_service.delete_category(cat_id)
         return jsonify({"message": "Category deleted."}), 200

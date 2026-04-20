@@ -3,9 +3,185 @@ from typing import Any
 from supabase import Client
 
 
+# Sentinel to cache whether the created_by column exists
+_CREATED_BY_COLUMN_EXISTS: bool | None = None
+_OWNER_USER_ID_COLUMN_EXISTS: bool | None = None
+
+
+def _has_created_by(supabase: Client) -> bool:
+    """Check once (per process) whether the created_by column exists."""
+    global _CREATED_BY_COLUMN_EXISTS
+    if _CREATED_BY_COLUMN_EXISTS is not None:
+        return _CREATED_BY_COLUMN_EXISTS
+    try:
+        supabase.table("documents").select("id, created_by").limit(1).execute()
+        _CREATED_BY_COLUMN_EXISTS = True
+    except Exception as e:
+        if "created_by" in str(e).lower() or "42703" in str(e):
+            _CREATED_BY_COLUMN_EXISTS = False
+        else:
+            # Unknown error — assume column doesn't exist to stay safe
+            _CREATED_BY_COLUMN_EXISTS = False
+    return _CREATED_BY_COLUMN_EXISTS
+
+
+def _has_owner_user_id(supabase: Client) -> bool:
+    """Check once (per process) whether the owner_user_id column exists."""
+    global _OWNER_USER_ID_COLUMN_EXISTS
+    if _OWNER_USER_ID_COLUMN_EXISTS is not None:
+        return _OWNER_USER_ID_COLUMN_EXISTS
+    try:
+        supabase.table("documents").select("id, owner_user_id").limit(1).execute()
+        _OWNER_USER_ID_COLUMN_EXISTS = True
+    except Exception as e:
+        if "owner_user_id" in str(e).lower() or "42703" in str(e):
+            _OWNER_USER_ID_COLUMN_EXISTS = False
+        else:
+            _OWNER_USER_ID_COLUMN_EXISTS = False
+    return _OWNER_USER_ID_COLUMN_EXISTS
+
+
 class DatabaseService:
     def __init__(self, supabase_client: Client) -> None:
         self.supabase = supabase_client
+
+    # ── Auth ──────────────────────────────────────────────────────
+
+    def sign_up(self, email: str, password: str, name: str) -> Any:
+        """
+        Creates a user. Uses Admin API to auto-confirm email, 
+        bypassing Supabase's email rate limits.
+        """
+        try:
+            # We use the admin API to bypass email confirmation / rate limits
+            response = self.supabase.auth.admin.create_user({
+                "email": email,
+                "password": password,
+                "email_confirm": True,
+                "user_metadata": {"full_name": name}
+            })
+            # Admin create_user returns UserResponse, we want to return it 
+            # so app.py can extract the user info. Note: No session is returned.
+            return response
+        except Exception as e:
+            # If admin creation fails (e.g. user exists), we return the error
+            # so app.py can handle it (like 409 Conflict)
+            err_msg = str(e).lower()
+            if "already registered" in err_msg or "already exists" in err_msg:
+                # Re-raise with a clear message for the controller
+                raise Exception("An account with this email already exists.") from e
+            
+            # Fallback to standard signup if admin isn't working for some reason
+            print(f"[auth.admin.signup.failed] {e} -> fallback to standard signup")
+            return self.supabase.auth.sign_up({
+                "email": email,
+                "password": password,
+                "options": {"data": {"full_name": name}}
+            })
+
+    def sign_in(self, email: str, password: str) -> Any:
+        try:
+            response = self.supabase.auth.sign_in_with_password({
+                "email": email,
+                "password": password
+            })
+            return response
+        except Exception as e:
+            if "email not confirmed" in str(e).lower():
+                # Auto-confirm the user if they were stuck
+                print(f"[auth.signin] Auto-confirming unconfirmed user: {email}")
+                self.confirm_user_by_email(email)
+                # Retry sign-in
+                return self.supabase.auth.sign_in_with_password({
+                    "email": email,
+                    "password": password
+                })
+            raise e
+
+    def resolve_login_identifier_to_email(self, identifier: str) -> str:
+        """Allow login with either email or username-like identifier."""
+        ident = (identifier or "").strip()
+        if not ident:
+            return ""
+        if "@" in ident:
+            return ident.lower()
+
+        # If a username is provided, map it to email via auth admin users.
+        try:
+            users_res = self.supabase.auth.admin.list_users()
+            users = users_res if isinstance(users_res, list) else getattr(users_res, "users", [])
+            ident_lower = ident.lower()
+
+            for u in users:
+                email = str(getattr(u, "email", "") or "").strip().lower()
+                full_name = str((getattr(u, "user_metadata", {}) or {}).get("full_name", "") or "").strip().lower()
+                if not email:
+                    continue
+
+                # Match username by exact email local-part or exact full name.
+                local_part = email.split("@", 1)[0]
+                if ident_lower == local_part or ident_lower == full_name:
+                    return email
+        except Exception as exc:
+            print(f"[auth.resolve.identifier.failed] {exc}")
+
+        # Fall back to original text so caller can return a normal auth error.
+        return ident.lower()
+
+    def get_user_identity_from_token(self, access_token: str) -> dict[str, str]:
+        """Resolve user identity fields from a Supabase access token."""
+        if not access_token:
+            return {"email": "", "id": ""}
+
+        # Support multiple supabase-py auth signatures across versions.
+        response = None
+        try:
+            response = self.supabase.auth.get_user(access_token)
+        except TypeError:
+            response = self.supabase.auth.get_user(jwt=access_token)
+
+        user = getattr(response, "user", None)
+        if user is None and isinstance(response, dict):
+            user = response.get("user") or (response.get("data") or {}).get("user")
+
+        if user is None:
+            return {"email": "", "id": ""}
+
+        if isinstance(user, dict):
+            return {
+                "email": str(user.get("email") or "").strip().lower(),
+                "id": str(user.get("id") or "").strip(),
+            }
+        return {
+            "email": str(getattr(user, "email", "") or "").strip().lower(),
+            "id": str(getattr(user, "id", "") or "").strip(),
+        }
+
+    def get_user_email_from_token(self, access_token: str) -> str:
+        """Backward-compatible helper for existing callers."""
+        return self.get_user_identity_from_token(access_token).get("email", "")
+
+    def confirm_user_by_email(self, email: str) -> bool:
+        """Finds a user by email and forces email_confirm=True via Admin API."""
+        try:
+            # list_users doesn't support server-side filtering in most py clients yet, 
+            # so we fetch and find (usually fine for small dev projects)
+            users_res = self.supabase.auth.admin.list_users()
+            # Depending on version, it might be a list or have a 'users' attribute
+            users = users_res if isinstance(users_res, list) else getattr(users_res, 'users', [])
+            
+            for u in users:
+                if getattr(u, 'email', '').lower() == email.lower():
+                    self.supabase.auth.admin.update_user_by_id(
+                        u.id, 
+                        {"email_confirm": True}
+                    )
+                    return True
+        except Exception as exc:
+            print(f"[auth.admin.confirm.failed] {exc}")
+        return False
+
+    # ── Storage ───────────────────────────────────────────────────
 
     def upload_to_storage(self, bucket: str, object_path: str, file_bytes: bytes, content_type: str) -> Any:
         response = self.supabase.storage.from_(bucket).upload(
@@ -21,6 +197,8 @@ class DatabaseService:
         print(f"[storage.move] bucket={bucket} from={old_path} to={new_path} response={response}")
         return response
 
+    # ── Documents ─────────────────────────────────────────────────
+
     def insert_document(
         self,
         file_name: str,
@@ -31,8 +209,10 @@ class DatabaseService:
         category: str = "uncategorized",
         confidence: float = 0,
         status: str = "auto-classified",
+        created_by: str = "",
+        owner_user_id: str = "",
     ) -> Any:
-        payload = {
+        payload: dict[str, Any] = {
             "file_name": file_name,
             "folder_location": folder_location,
             "content_text": content_text,
@@ -42,19 +222,142 @@ class DatabaseService:
             "confidence": float(confidence or 0),
             "status": status,
         }
-        response = self.supabase.table("documents").upsert(payload).execute()
-        print(f"[table.insert] file={file_name} path={folder_location} response={self.debug_payload(response)}")
-        return response
 
-    def search_documents(self, query: str) -> Any:
-        response = (
-            self.supabase.table("documents")
-            .select("id,file_name,folder_location,file_size,mime_type,category,confidence,status")
-            .text_search("search_vector", query)
-            .execute()
+        # Only include created_by if the column exists
+        if _has_created_by(self.supabase) and created_by:
+            payload["created_by"] = created_by
+        if _has_owner_user_id(self.supabase) and owner_user_id:
+            payload["owner_user_id"] = owner_user_id
+
+        try:
+            response = self.supabase.table("documents").upsert(payload).execute()
+            print(
+                f"[table.insert] file={file_name} path={folder_location} "
+                f"created_by={created_by if _has_created_by(self.supabase) else '(column missing)'} "
+                f"response={self.debug_payload(response)}"
+            )
+            return response
+        except Exception as exc:  # noqa: BLE001
+            # Emit detailed debug info to help diagnose RLS / permission issues.
+            err_text = str(exc)
+            print(f"[table.insert.error] file={file_name} path={folder_location} error={err_text}")
+            try:
+                # If the supabase client returned a response-like object, attempt to log it.
+                import json
+
+                if hasattr(exc, "args") and exc.args:
+                    try:
+                        print("[table.insert.error.args]", json.dumps(exc.args[0], default=str))
+                    except Exception:
+                        print("[table.insert.error.args.raw]", exc.args)
+            except Exception:
+                pass
+            raise
+
+    def search_documents(self, query: str, created_by: str = "", user_id: str = "") -> Any:
+        col_exists = _has_created_by(self.supabase)
+        owner_col_exists = _has_owner_user_id(self.supabase)
+        select_cols = (
+            "id,file_name,folder_location,file_size,mime_type,category,confidence,status,created_by,owner_user_id"
+            if col_exists or owner_col_exists
+            else "id,file_name,folder_location,file_size,mime_type,category,confidence,status"
         )
+        req = (
+            self.supabase.table("documents")
+            .select(select_cols)
+            .text_search("search_vector", query)
+        )
+        if created_by and col_exists:
+            req = req.eq("created_by", created_by)
+        elif user_id and owner_col_exists:
+            req = req.eq("owner_user_id", user_id)
+        elif user_id:
+            req = req.ilike("folder_location", f"users/{user_id}/%")
+        response = req.execute()
         print(f"[search.response] payload={self.debug_payload(response)}")
         return response
+
+    def get_documents_by_user(self, created_by: str, user_id: str = "") -> Any:
+        """Return documents for the given user. Falls back to all docs if column missing."""
+        col_exists = _has_created_by(self.supabase)
+        owner_col_exists = _has_owner_user_id(self.supabase)
+        select_cols = (
+            "id,file_name,folder_location,file_size,mime_type,category,confidence,status,created_by,owner_user_id"
+            if col_exists or owner_col_exists
+            else "id,file_name,folder_location,file_size,mime_type,category,confidence,status"
+        )
+
+        req = (
+            self.supabase.table("documents")
+            .select(select_cols)
+            .order("id", desc=True)
+        )
+        if created_by and col_exists:
+            req = req.eq("created_by", created_by)
+        elif user_id and owner_col_exists:
+            req = req.eq("owner_user_id", user_id)
+        elif user_id:
+            req = req.ilike("folder_location", f"users/{user_id}/%")
+
+        response = req.execute()
+        print(
+            f"[get_documents_by_user] created_by={created_by} "
+            f"col_exists={col_exists} count={len(response.data or [])}"
+        )
+        return response
+
+    def get_user_stats(self, created_by: str, user_id: str = "") -> dict[str, Any]:
+        """Calculates total storage used by the user and total documents limit."""
+        col_exists = _has_created_by(self.supabase)
+        owner_col_exists = _has_owner_user_id(self.supabase)
+        req = self.supabase.table("documents").select("file_size")
+        if created_by and col_exists:
+            req = req.eq("created_by", created_by)
+        elif user_id and owner_col_exists:
+            req = req.eq("owner_user_id", user_id)
+        elif user_id:
+            req = req.ilike("folder_location", f"users/{user_id}/%")
+        
+        response = req.execute()
+        doc_list = response.data or []
+        
+        total_size = sum(int(d.get("file_size") or 0) for d in doc_list)
+        return {
+            "total_bytes_used": total_size,
+            "document_count": len(doc_list)
+        }
+
+    def user_owns_path(self, path: str, created_by: str = "", user_id: str = "") -> bool:
+        """Check ownership for a storage path in the documents table."""
+        if not path:
+            return False
+
+        if _has_created_by(self.supabase) and created_by:
+            response = (
+                self.supabase.table("documents")
+                .select("id")
+                .eq("folder_location", path)
+                .eq("created_by", created_by)
+                .limit(1)
+                .execute()
+            )
+            return bool(response.data)
+
+        if _has_owner_user_id(self.supabase) and user_id:
+            response = (
+                self.supabase.table("documents")
+                .select("id")
+                .eq("folder_location", path)
+                .eq("owner_user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            return bool(response.data)
+
+        if user_id:
+            return path.startswith(f"users/{user_id}/")
+
+        return False
 
     # ── Admin: Documents ──────────────────────────────────────────
 
@@ -62,15 +365,15 @@ class DatabaseService:
         response = self.supabase.table("documents").select("*").order("id", desc=True).execute()
         return response
 
-    def get_document(self, doc_id: int) -> Any:
+    def get_document(self, doc_id: str) -> Any:
         response = self.supabase.table("documents").select("*").eq("id", doc_id).single().execute()
         return response
 
-    def update_document(self, doc_id: int, payload: dict[str, Any]) -> Any:
+    def update_document(self, doc_id: str, payload: dict[str, Any]) -> Any:
         response = self.supabase.table("documents").update(payload).eq("id", doc_id).execute()
         return response
 
-    def delete_document(self, doc_id: int) -> Any:
+    def delete_document(self, doc_id: str) -> Any:
         response = self.supabase.table("documents").delete().eq("id", doc_id).execute()
         return response
 
@@ -92,7 +395,7 @@ class DatabaseService:
         response = self.supabase.table("document_categories").delete().eq("id", cat_id).execute()
         return response
 
-    # ── Admin: Storage helpers ────────────────────────────────────
+    # ── Storage helpers ───────────────────────────────────────────
 
     def get_download_url(self, path: str, expires_in: int = 120) -> str:
         result = self.supabase.storage.from_("documents").create_signed_url(path, expires_in)
@@ -116,7 +419,6 @@ class DatabaseService:
         classified = sum(1 for d in doc_list if (d.get("status") or "").lower() == "classified")
         total_size = sum(int(d.get("file_size") or 0) for d in doc_list)
 
-        # Category breakdown
         breakdown: dict[str, int] = {}
         for d in doc_list:
             cat = d.get("category") or "uncategorized"

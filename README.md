@@ -119,7 +119,16 @@ Create a `.env` file in the project root with:
 SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_service_role_or_server_key
 TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+ADMIN_EMAILS=admin1@example.com,admin2@example.com
 ```
+
+## Multi-user Security Notes
+
+- User-facing routes now require a valid `Authorization: Bearer <access_token>` header.
+- User identity is derived server-side from the access token (not from client `created_by` values).
+- Download/share links are restricted to files owned by the authenticated user.
+- If `documents.created_by` or `documents.owner_user_id` is unavailable, the app falls back to per-user storage path prefixes (`users/<auth_user_id>/...`) for ownership checks.
+- Admin routes require the authenticated email to be listed in `ADMIN_EMAILS`.
 
 ## Local Setup
 
