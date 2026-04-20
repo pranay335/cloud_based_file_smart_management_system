@@ -80,12 +80,13 @@ function clearFieldError(groupId, errorId) {
 function isValidEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
 /* ---------- Write session to localStorage + redirect ---------- */
-function handleSuccess(email, name, token) {
+function handleSuccess(email, name, token, refreshToken = null) {
     const initials = name.split(' ').map(w => w[0]).join('').substring(0, 2).toUpperCase();
 
     localStorage.setItem('docclassifier_session', JSON.stringify({
         email, name, initials,
         token: token || null,
+        refreshToken: refreshToken || null,
         loginTime: Date.now(),
     }));
 
@@ -143,7 +144,7 @@ loginForm && loginForm.addEventListener('submit', async e => {
         if (res.ok && data.user && data.session?.access_token) {
             const email = String(data.user?.email || identifier).toLowerCase();
             const name = data.user?.user_metadata?.full_name || nameFromEmail(email);
-            handleSuccess(email, name, data.session?.access_token);
+            handleSuccess(email, name, data.session?.access_token, data.session?.refresh_token);
             return;
         }
 
@@ -222,7 +223,7 @@ registerForm && registerForm.addEventListener('submit', async e => {
             setTimeout(() => switchTab('login'), 1800);
         } else {
             // Session available immediately — log straight in
-            handleSuccess(email, name, data.session?.access_token);
+            handleSuccess(email, name, data.session?.access_token, data.session?.refresh_token);
         }
     } catch (err) {
         setBtnLoading(registerBtn, false, 'Create my account');

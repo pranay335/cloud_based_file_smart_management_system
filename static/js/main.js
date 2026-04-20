@@ -16,8 +16,18 @@ function getSession() {
     catch { return null; }
 }
 
-const session = getSession();
+let session = getSession();
 if (!session || !session.email || !session.token) {
+    localStorage.removeItem(SESSION_KEY);
+    window.location.replace('/login');
+}
+
+function setSession(nextSession) {
+    session = nextSession;
+    localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession || {}));
+}
+
+function clearSessionAndRedirect() {
     localStorage.removeItem(SESSION_KEY);
     window.location.replace('/login');
 }
@@ -25,6 +35,46 @@ if (!session || !session.email || !session.token) {
 function getAuthHeaders() {
     const token = session?.token;
     return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function tryRefreshSession() {
+    const refreshToken = session?.refreshToken;
+    if (!refreshToken) return false;
+
+    try {
+        const res = await fetch('/api/auth/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        if (!res.ok) return false;
+        const payload = await res.json();
+        const nextAccess = payload?.session?.access_token;
+        const nextRefresh = payload?.session?.refresh_token || refreshToken;
+        if (!nextAccess) return false;
+        setSession({ ...session, token: nextAccess, refreshToken: nextRefresh, loginTime: Date.now() });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function fetchWithAuth(url, options = {}, retryOn401 = true) {
+    const headers = { ...(options.headers || {}), ...getAuthHeaders() };
+    const response = await fetch(url, { ...options, headers });
+
+    if (response.status !== 401 || !retryOn401) {
+        return response;
+    }
+
+    const refreshed = await tryRefreshSession();
+    if (!refreshed) {
+        clearSessionAndRedirect();
+        return response;
+    }
+
+    const retryHeaders = { ...(options.headers || {}), ...getAuthHeaders() };
+    return fetch(url, { ...options, headers: retryHeaders });
 }
 
 /* ---------- Category colour map ---------- */
@@ -104,6 +154,7 @@ const docModalTitle    = document.getElementById('docModalTitle');
 const docModalBody     = document.getElementById('docModalBody');
 const docModalClose    = document.getElementById('docModalClose');
 const docModalCloseBtn = document.getElementById('docModalCloseBtn');
+const docModalDeleteBtn = document.getElementById('docModalDeleteBtn');
 const docModalDownloadBtn = document.getElementById('docModalDownloadBtn');
 
 // Toast
@@ -117,6 +168,7 @@ let allMyFiles    = [];   // raw documents from API
 let activeTab     = 'all';
 let viewMode      = 'grid'; // 'grid' | 'list'
 let modalDocPath  = '';
+let modalDocName  = '';
 
 /* ============================================================
    Greeting + user identity
@@ -143,10 +195,10 @@ function populateUserUI() {
 async function loadStorageStats() {
     if (!session) return;
     try {
-        const res = await fetch('/api/user/stats', { headers: getAuthHeaders() });
+        const res = await fetchWithAuth('/api/user/stats');
         const stats = await parseJsonGuarded(res);
         const used = stats.total_bytes_used || 0;
-        const total = stats.quota_bytes || (5 * 1024 * 1024 * 1024);
+        const total = stats.quota_bytes || (50 * 1024 * 1024);
         
         const storageVal = document.getElementById('storageVal');
         const storageFill = document.getElementById('storageFill');
@@ -305,9 +357,8 @@ async function classifyAll() {
         const formData = new FormData();
         uploadedFiles.forEach(f => formData.append('files', f));
 
-        const res  = await fetch('/api/classify', {
+        const res  = await fetchWithAuth('/api/classify', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: formData,
         });
         const data = await parseJsonGuarded(res);
@@ -335,7 +386,7 @@ function startJobPolling(jobId) {
     stopPolling();
     const poll = async () => {
         try {
-            const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, { headers: getAuthHeaders() });
+            const res = await fetchWithAuth(`/api/jobs/${encodeURIComponent(jobId)}`);
             const job = await parseJsonGuarded(res);
 
             if (job.status === 'completed') {
@@ -411,7 +462,7 @@ async function loadMyFiles() {
     myFilesContainer.innerHTML = `<div class="empty-state"><div class="status-spinner" style="margin:0 auto 8px;"></div><div class="empty-state-text">Loading your files…</div></div>`;
 
     try {
-        const res  = await fetch('/api/my-documents', { headers: getAuthHeaders() });
+        const res  = await fetchWithAuth('/api/my-documents');
         const json = await parseJsonGuarded(res);
         allMyFiles = Array.isArray(json.data) ? json.data : [];
 
@@ -585,6 +636,9 @@ function buildFileCard(f) {
                 <button class="icon-btn icon-btn-download" title="Download"       onclick="event.stopPropagation();downloadDoc('${escH(path)}')">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 </button>
+                <button class="icon-btn icon-btn-delete"   title="Delete"         onclick="event.stopPropagation();deleteDoc('${escH(path)}', '${escH(f.file_name || '')}')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                </button>
             </div>
         </div>`;
 
@@ -605,12 +659,17 @@ function openDocModal(doc) {
     const cat = (doc.category || 'uncategorized').toLowerCase();
     const cs  = catStyle(cat);
     modalDocPath = doc.folder_location || '';
+    modalDocName = doc.file_name || 'this file';
 
     docModalTitle.textContent = doc.file_name || 'Document';
     docModalDownloadBtn.onclick = () => downloadDoc(modalDocPath);
+    if (docModalDeleteBtn) {
+        docModalDeleteBtn.onclick = () => deleteDoc(modalDocPath, modalDocName);
+    }
 
     const preview = (doc.content_text || '').substring(0, 1500);
     const hasMore  = (doc.content_text || '').length > 1500;
+    const summary = (doc.summary_text || '').trim();
 
     docModalBody.innerHTML = `
         <div class="detail-grid">
@@ -633,6 +692,9 @@ function openDocModal(doc) {
             <div class="detail-row"><div class="detail-label">File Size</div><div class="detail-value">${typeof doc.file_size==='number' ? fmtSize(doc.file_size) : '—'}</div></div>
             <div class="detail-row"><div class="detail-label">MIME Type</div><div class="detail-value">${escH(doc.mime_type || '—')}</div></div>
             <div class="detail-row"><div class="detail-label">Status</div><div class="detail-value">${escH(doc.status || '—')}</div></div>
+            ${summary ? `
+            <div class="detail-row"><div class="detail-label">Summary</div><div class="detail-value" style="line-height:1.6;">${escH(summary)}</div></div>
+            ` : ''}
             ${preview ? `
             <div class="detail-row">
                 <div class="detail-label">Content Preview</div>
@@ -672,7 +734,7 @@ async function doSearch(query) {
 
     try {
         const url = `/search?q=${encodeURIComponent(query)}`;
-        const res  = await fetch(url, { headers: getAuthHeaders() });
+        const res  = await fetchWithAuth(url);
         const data = await parseJsonGuarded(res);
         const results = data.results || [];
 
@@ -705,6 +767,9 @@ async function doSearch(query) {
                     <button class="action-btn action-download" title="Download" onclick="downloadDoc('${escH(r.folder_location||'')}')">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                     </button>
+                    <button class="action-btn action-delete" title="Delete" onclick="deleteDoc('${escH(r.folder_location||'')}', '${escH(r.file_name||'')}')">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                    </button>
                 </td>
             </tr>`;
         }).join('');
@@ -727,7 +792,7 @@ async function doSearch(query) {
 async function downloadDoc(path) {
     if (!path) return showToast('error', 'Download', 'No file path available.');
     try {
-        const res  = await fetch(`/api/download?path=${encodeURIComponent(path)}`, { headers: getAuthHeaders() });
+        const res  = await fetchWithAuth(`/api/download?path=${encodeURIComponent(path)}`);
         const json = await parseJsonGuarded(res);
         if (json.url) window.open(json.url, '_blank');
         else showToast('error', 'Download', 'Could not generate download URL.');
@@ -737,17 +802,42 @@ async function downloadDoc(path) {
 async function shareDoc(path) {
     if (!path) return showToast('error', 'Share', 'No file path available.');
     try {
-        const res  = await fetch(`/api/share?path=${encodeURIComponent(path)}`, { headers: getAuthHeaders() });
+        const res  = await fetchWithAuth(`/api/share?path=${encodeURIComponent(path)}`);
         const json = await parseJsonGuarded(res);
         if (json.url) { await navigator.clipboard.writeText(json.url); showToast('success', 'Link Copied', 'Share link copied (valid 7 days).'); }
         else showToast('error', 'Share', 'Could not generate link.');
     } catch (e) { showToast('error', 'Share Failed', e.message); }
 }
 
+async function deleteDoc(path, fileName = 'this file') {
+    if (!path) {
+        showToast('error', 'Delete', 'No file path available.');
+        return;
+    }
+
+    const ok = window.confirm(`Delete ${fileName}? This cannot be undone.`);
+    if (!ok) return;
+
+    try {
+        const res = await fetchWithAuth('/api/my-documents', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path }),
+        });
+        const payload = await parseJsonGuarded(res);
+        showToast('success', 'Deleted', payload.message || 'File deleted successfully.');
+        closeDocModal();
+        await loadMyFiles();
+    } catch (e) {
+        showToast('error', 'Delete Failed', e.message);
+    }
+}
+
 // Expose to inline onclick handlers
 window.openDocModal = openDocModal;
 window.downloadDoc  = downloadDoc;
 window.shareDoc     = shareDoc;
+window.deleteDoc    = deleteDoc;
 window.switchView   = switchView;
 
 /* ============================================================

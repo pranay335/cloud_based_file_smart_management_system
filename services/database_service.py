@@ -6,6 +6,8 @@ from supabase import Client
 # Sentinel to cache whether the created_by column exists
 _CREATED_BY_COLUMN_EXISTS: bool | None = None
 _OWNER_USER_ID_COLUMN_EXISTS: bool | None = None
+_SUMMARY_TEXT_COLUMN_EXISTS: bool | None = None
+_CONTENT_HASH_COLUMN_EXISTS: bool | None = None
 
 
 def _has_created_by(supabase: Client) -> bool:
@@ -41,9 +43,64 @@ def _has_owner_user_id(supabase: Client) -> bool:
     return _OWNER_USER_ID_COLUMN_EXISTS
 
 
+def _has_summary_text(supabase: Client) -> bool:
+    """Check once (per process) whether the summary_text column exists."""
+    global _SUMMARY_TEXT_COLUMN_EXISTS
+    if _SUMMARY_TEXT_COLUMN_EXISTS is not None:
+        return _SUMMARY_TEXT_COLUMN_EXISTS
+    try:
+        supabase.table("documents").select("id, summary_text").limit(1).execute()
+        _SUMMARY_TEXT_COLUMN_EXISTS = True
+    except Exception as e:
+        if "summary_text" in str(e).lower() or "42703" in str(e):
+            _SUMMARY_TEXT_COLUMN_EXISTS = False
+        else:
+            _SUMMARY_TEXT_COLUMN_EXISTS = False
+    return _SUMMARY_TEXT_COLUMN_EXISTS
+
+
+def _has_content_hash(supabase: Client) -> bool:
+    """Check once (per process) whether the content_hash column exists."""
+    global _CONTENT_HASH_COLUMN_EXISTS
+    if _CONTENT_HASH_COLUMN_EXISTS is not None:
+        return _CONTENT_HASH_COLUMN_EXISTS
+    try:
+        supabase.table("documents").select("id, content_hash").limit(1).execute()
+        _CONTENT_HASH_COLUMN_EXISTS = True
+    except Exception as e:
+        if "content_hash" in str(e).lower() or "42703" in str(e):
+            _CONTENT_HASH_COLUMN_EXISTS = False
+        else:
+            _CONTENT_HASH_COLUMN_EXISTS = False
+    return _CONTENT_HASH_COLUMN_EXISTS
+
+
 class DatabaseService:
     def __init__(self, supabase_client: Client) -> None:
         self.supabase = supabase_client
+
+    def _document_select_columns(self, include_content_text: bool = False) -> str:
+        cols = [
+            "id",
+            "file_name",
+            "folder_location",
+            "file_size",
+            "mime_type",
+            "category",
+            "confidence",
+            "status",
+        ]
+        if include_content_text:
+            cols.append("content_text")
+        if _has_created_by(self.supabase):
+            cols.append("created_by")
+        if _has_owner_user_id(self.supabase):
+            cols.append("owner_user_id")
+        if _has_summary_text(self.supabase):
+            cols.append("summary_text")
+        if _has_content_hash(self.supabase):
+            cols.append("content_hash")
+        return ",".join(cols)
 
     # ── Auth ──────────────────────────────────────────────────────
 
@@ -97,6 +154,17 @@ class DatabaseService:
                     "password": password
                 })
             raise e
+
+    def refresh_session(self, refresh_token: str) -> Any:
+        """Refresh an expired access token using a refresh token."""
+        if not refresh_token:
+            raise ValueError("Missing refresh token")
+
+        # supabase-py signatures may vary by version.
+        try:
+            return self.supabase.auth.refresh_session(refresh_token)
+        except TypeError:
+            return self.supabase.auth.refresh_session({"refresh_token": refresh_token})
 
     def resolve_login_identifier_to_email(self, identifier: str) -> str:
         """Allow login with either email or username-like identifier."""
@@ -211,6 +279,8 @@ class DatabaseService:
         status: str = "auto-classified",
         created_by: str = "",
         owner_user_id: str = "",
+        summary_text: str = "",
+        content_hash: str = "",
     ) -> Any:
         payload: dict[str, Any] = {
             "file_name": file_name,
@@ -228,6 +298,10 @@ class DatabaseService:
             payload["created_by"] = created_by
         if _has_owner_user_id(self.supabase) and owner_user_id:
             payload["owner_user_id"] = owner_user_id
+        if _has_summary_text(self.supabase):
+            payload["summary_text"] = summary_text or ""
+        if _has_content_hash(self.supabase) and content_hash:
+            payload["content_hash"] = content_hash
 
         try:
             response = self.supabase.table("documents").upsert(payload).execute()
@@ -257,11 +331,7 @@ class DatabaseService:
     def search_documents(self, query: str, created_by: str = "", user_id: str = "") -> Any:
         col_exists = _has_created_by(self.supabase)
         owner_col_exists = _has_owner_user_id(self.supabase)
-        select_cols = (
-            "id,file_name,folder_location,file_size,mime_type,category,confidence,status,created_by,owner_user_id"
-            if col_exists or owner_col_exists
-            else "id,file_name,folder_location,file_size,mime_type,category,confidence,status"
-        )
+        select_cols = self._document_select_columns(include_content_text=False)
         req = (
             self.supabase.table("documents")
             .select(select_cols)
@@ -281,11 +351,7 @@ class DatabaseService:
         """Return documents for the given user. Falls back to all docs if column missing."""
         col_exists = _has_created_by(self.supabase)
         owner_col_exists = _has_owner_user_id(self.supabase)
-        select_cols = (
-            "id,file_name,folder_location,file_size,mime_type,category,confidence,status,created_by,owner_user_id"
-            if col_exists or owner_col_exists
-            else "id,file_name,folder_location,file_size,mime_type,category,confidence,status"
-        )
+        select_cols = self._document_select_columns(include_content_text=False)
 
         req = (
             self.supabase.table("documents")
@@ -305,6 +371,65 @@ class DatabaseService:
             f"col_exists={col_exists} count={len(response.data or [])}"
         )
         return response
+
+    def get_documents_for_similarity(self, created_by: str = "", user_id: str = "", limit: int = 300) -> list[dict[str, Any]]:
+        """Return user-scoped docs with content for semantic search and dedup checks."""
+        col_exists = _has_created_by(self.supabase)
+        owner_col_exists = _has_owner_user_id(self.supabase)
+        req = (
+            self.supabase.table("documents")
+            .select(self._document_select_columns(include_content_text=True))
+            .order("id", desc=True)
+            .limit(max(1, min(limit, 1000)))
+        )
+        if created_by and col_exists:
+            req = req.eq("created_by", created_by)
+        elif user_id and owner_col_exists:
+            req = req.eq("owner_user_id", user_id)
+        elif user_id:
+            req = req.ilike("folder_location", f"users/{user_id}/%")
+
+        response = req.execute()
+        docs = response.data or []
+        print(f"[similarity.candidates] count={len(docs)}")
+        return docs
+
+    def find_exact_duplicate_by_hash(
+        self,
+        content_hash: str,
+        created_by: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Return first matching document for a hash in the same user scope."""
+        if not content_hash:
+            return None
+        if not _has_content_hash(self.supabase):
+            return None
+
+        col_exists = _has_created_by(self.supabase)
+        owner_col_exists = _has_owner_user_id(self.supabase)
+        select_cols = ["id", "file_name", "folder_location", "status"]
+        if col_exists:
+            select_cols.append("created_by")
+        if owner_col_exists:
+            select_cols.append("owner_user_id")
+        req = (
+            self.supabase.table("documents")
+            .select(",".join(select_cols))
+            .eq("content_hash", content_hash)
+            .order("id", desc=True)
+            .limit(1)
+        )
+        if created_by and col_exists:
+            req = req.eq("created_by", created_by)
+        elif user_id and owner_col_exists:
+            req = req.eq("owner_user_id", user_id)
+        elif user_id:
+            req = req.ilike("folder_location", f"users/{user_id}/%")
+
+        response = req.execute()
+        data = response.data or []
+        return data[0] if data else None
 
     def get_user_stats(self, created_by: str, user_id: str = "") -> dict[str, Any]:
         """Calculates total storage used by the user and total documents limit."""
@@ -358,6 +483,49 @@ class DatabaseService:
             return path.startswith(f"users/{user_id}/")
 
         return False
+
+    def get_user_document_by_path(self, path: str, created_by: str = "", user_id: str = "") -> dict[str, Any] | None:
+        """Return a user-owned document row for a storage path."""
+        if not path:
+            return None
+
+        col_exists = _has_created_by(self.supabase)
+        owner_col_exists = _has_owner_user_id(self.supabase)
+        select_cols = ["id", "file_name", "folder_location"]
+        if col_exists:
+            select_cols.append("created_by")
+        if owner_col_exists:
+            select_cols.append("owner_user_id")
+
+        req = (
+            self.supabase.table("documents")
+            .select(",".join(select_cols))
+            .eq("folder_location", path)
+            .order("id", desc=True)
+            .limit(1)
+        )
+
+        if created_by and col_exists:
+            req = req.eq("created_by", created_by)
+        elif user_id and owner_col_exists:
+            req = req.eq("owner_user_id", user_id)
+        elif user_id:
+            req = req.ilike("folder_location", f"users/{user_id}/%")
+
+        response = req.execute()
+        data = response.data or []
+        return data[0] if data else None
+
+    def delete_user_document_by_path(self, path: str, created_by: str = "", user_id: str = "") -> bool:
+        """Delete a user-owned document row by storage path."""
+        doc = self.get_user_document_by_path(path, created_by=created_by, user_id=user_id)
+        if not doc:
+            return False
+        doc_id = str(doc.get("id") or "").strip()
+        if not doc_id:
+            return False
+        self.delete_document(doc_id)
+        return True
 
     # ── Admin: Documents ──────────────────────────────────────────
 
